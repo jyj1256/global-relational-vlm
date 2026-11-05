@@ -1,0 +1,62 @@
+# Python
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.mypy_cache/
+.coverage
+htmlcov/
+
+# Environments and editors
+.venv/
+venv/
+env/
+.vscode/
+.idea/
+
+# Credentials
+.env
+.env.*
+!.env.example
+
+# Datasets and pretrained models
+datasets/
+pretrained/
+data/raw/
+data/downloads/
+
+# Generated outputs
+outputs/
+runs/
+wandb/
+logs/
+
+# Model weights, caches, and arrays
+*.pt
+*.pth
+*.ckpt
+*.bin
+*.safetensors
+*.npy
+*.npz
+*.progress.pt
+
+# Archives
+*.zip
+*.tar
+*.tar.gz
+*.tgz
+
+# Temporary and backup files
+*.tmp
+*.bak
+*.bak*
+*~
+.DS_Store
+
+# Debug statistics
+configs/test_*.json
+configs/gqa_descriptor_statistics_20_seed2026.json
+configs/gqa_descriptor_statistics_100_seed2026.json
+
+# Personal test images
+tests/assets/
