@@ -24,6 +24,10 @@ from vlm.utils.first_pass_cache import (
     build_cache_identity,
     load_first_pass_cache,
 )
+from vlm.utils.object_detection_cache import (
+    detection_cache_path,
+    load_object_detection_cache,
+)
 from vlm.utils.training_checkpoint import (
     load_training_checkpoint,
 )
@@ -50,6 +54,15 @@ DEFAULT_CACHE_ROOT = (
     PROJECT_ROOT
     / "vlm/outputs/first_pass_cache/"
     "nf4_qlora_maxnum1_val_debug100"
+)
+DEFAULT_DETECTION_CACHE_ROOT = (
+    PROJECT_ROOT
+    / "vlm/outputs/object_detections/"
+    "yolo11s_coco"
+)
+DEFAULT_DETECTION_CACHE_MANIFEST = (
+    DEFAULT_DETECTION_CACHE_ROOT
+    / "manifests/val_debug_100.json"
 )
 DEFAULT_TRAINING_ROOT = (
     PROJECT_ROOT
@@ -99,6 +112,26 @@ def parse_args():
         "--first-pass-cache",
         type=Path,
         default=DEFAULT_CACHE_ROOT,
+    )
+    parser.add_argument(
+        "--graph-version",
+        type=str,
+        choices=("v0", "v1"),
+        default="v0",
+    )
+    parser.add_argument(
+        "--detection-cache-root",
+        type=Path,
+        default=(
+            DEFAULT_DETECTION_CACHE_ROOT
+        ),
+    )
+    parser.add_argument(
+        "--detection-cache-manifest",
+        type=Path,
+        default=(
+            DEFAULT_DETECTION_CACHE_MANIFEST
+        ),
     )
     parser.add_argument(
         "--checkpoint",
@@ -162,6 +195,129 @@ def parse_args():
     )
 
     return parser.parse_args()
+
+
+def load_detection_manifest(
+    cache_root,
+    metadata_path,
+    dataset,
+):
+    if not cache_root.is_dir():
+        raise FileNotFoundError(
+            cache_root
+        )
+
+    if not metadata_path.is_file():
+        raise FileNotFoundError(
+            metadata_path
+        )
+
+    metadata = load_json(
+        metadata_path
+    )
+
+    dataset_image_ids = sorted({
+        str(
+            dataset[index][
+                "image_id"
+            ]
+        )
+        for index in range(len(dataset))
+    })
+
+    cached_image_ids = sorted(
+        str(image_id)
+        for image_id in metadata.get(
+            "image_ids",
+            [],
+        )
+    )
+
+    if metadata.get("status") != "complete":
+        raise RuntimeError(
+            "Object Detection cache is "
+            "not complete."
+        )
+
+    if cached_image_ids != (
+        dataset_image_ids
+    ):
+        raise ValueError(
+            "Object Detection cache image "
+            "IDs do not match the dataset."
+        )
+
+    if int(
+        metadata.get(
+            "unique_images",
+            -1,
+        )
+    ) != len(dataset_image_ids):
+        raise ValueError(
+            "Object Detection cache unique "
+            "image count does not match."
+        )
+
+    if int(
+        metadata.get(
+            "completed_images",
+            -1,
+        )
+    ) != len(dataset_image_ids):
+        raise ValueError(
+            "Object Detection cache completed "
+            "image count does not match."
+        )
+
+    detector = metadata.get(
+        "detector"
+    )
+    configuration = metadata.get(
+        "configuration"
+    )
+
+    if not isinstance(detector, dict):
+        raise ValueError(
+            "Detection metadata does not "
+            "contain detector information."
+        )
+
+    required_detector_fields = (
+        "model_name",
+        "model_version",
+        "weights_sha256",
+    )
+
+    for field in required_detector_fields:
+        if not detector.get(field):
+            raise ValueError(
+                "Detection metadata is missing "
+                f"detector field: {field}."
+            )
+
+    if not isinstance(
+        configuration,
+        dict,
+    ):
+        raise ValueError(
+            "Detection metadata does not "
+            "contain configuration."
+        )
+
+    for image_id in dataset_image_ids:
+        entry_path = (
+            detection_cache_path(
+                cache_root,
+                image_id,
+            )
+        )
+
+        if not entry_path.is_file():
+            raise FileNotFoundError(
+                entry_path
+            )
+
+    return metadata
 
 
 def load_existing_predictions(
@@ -336,6 +492,25 @@ def main():
         if not path.is_file():
             raise FileNotFoundError(path)
 
+    if args.graph_version == "v1":
+        if not (
+            args
+            .detection_cache_root
+            .is_dir()
+        ):
+            raise FileNotFoundError(
+                args.detection_cache_root
+            )
+
+        if not (
+            args
+            .detection_cache_manifest
+            .is_file()
+        ):
+            raise FileNotFoundError(
+                args.detection_cache_manifest
+            )
+
     dataset = GQADataset(
         manifest_path=args.manifest,
         data_root=args.data_root,
@@ -355,6 +530,41 @@ def main():
     training_configuration = (
         load_json(args.run_config)
     )
+
+    checkpoint_graph_version = str(
+        training_configuration.get(
+            "graph_version",
+            "v0",
+        )
+    )
+
+    if checkpoint_graph_version != (
+        args.graph_version
+    ):
+        raise ValueError(
+            "Requested graph version does "
+            "not match the training run: "
+            f"requested={args.graph_version}, "
+            f"checkpoint="
+            f"{checkpoint_graph_version}."
+        )
+
+    detection_metadata = None
+
+    if args.graph_version == "v1":
+        detection_metadata = (
+            load_detection_manifest(
+                cache_root=(
+                    args
+                    .detection_cache_root
+                ),
+                metadata_path=(
+                    args
+                    .detection_cache_manifest
+                ),
+                dataset=dataset,
+            )
+        )
 
     generation_configuration = {
         "max_new_tokens": (
@@ -413,6 +623,52 @@ def main():
             "strict normalized exact match"
         ),
     }
+
+    if args.graph_version == "v1":
+        evaluation_configuration[
+            "graph_version"
+        ] = "v1"
+
+        evaluation_configuration[
+            "object_detection_cache"
+        ] = {
+            "cache_root": str(
+                args
+                .detection_cache_root
+                .resolve()
+            ),
+            "metadata_path": str(
+                args
+                .detection_cache_manifest
+                .resolve()
+            ),
+            "metadata_sha256": (
+                file_sha256(
+                    args
+                    .detection_cache_manifest
+                )
+            ),
+            "unique_images": (
+                detection_metadata[
+                    "unique_images"
+                ]
+            ),
+            "image_id_sha256": (
+                detection_metadata.get(
+                    "image_id_sha256"
+                )
+            ),
+            "detector": (
+                detection_metadata[
+                    "detector"
+                ]
+            ),
+            "configuration": (
+                detection_metadata[
+                    "configuration"
+                ]
+            ),
+        }
 
     args.output_dir.mkdir(
         parents=True,
@@ -516,6 +772,16 @@ def main():
             "protocol"
         ],
     )
+    print(
+        "  Graph version:",
+        args.graph_version,
+    )
+
+    if args.graph_version == "v1":
+        print(
+            "  Detection metadata:",
+            args.detection_cache_manifest,
+        )
 
     if samples_to_process:
         components = load_training_model(
@@ -531,6 +797,9 @@ def main():
             ),
             gpu_memory="10GiB",
             cpu_memory="48GiB",
+            graph_version=(
+                args.graph_version
+            ),
         )
 
         integrated_model = components[
@@ -655,6 +924,77 @@ def main():
                 dtype=torch.bfloat16,
             )
 
+            detections = None
+
+            if args.graph_version == "v1":
+                image_id = str(
+                    sample["image_id"]
+                )
+                detector_metadata = (
+                    detection_metadata[
+                        "detector"
+                    ]
+                )
+
+                detection_result = (
+                    load_object_detection_cache(
+                        input_path=(
+                            detection_cache_path(
+                                args
+                                .detection_cache_root,
+                                image_id,
+                            )
+                        ),
+                        expected_image_id=(
+                            image_id
+                        ),
+                        expected_image_sha256=(
+                            file_sha256(
+                                Path(
+                                    sample[
+                                        "image_path"
+                                    ]
+                                )
+                            )
+                        ),
+                        expected_model_name=(
+                            detector_metadata[
+                                "model_name"
+                            ]
+                        ),
+                        expected_model_version=(
+                            detector_metadata[
+                                "model_version"
+                            ]
+                        ),
+                        expected_weights_sha256=(
+                            detector_metadata[
+                                "weights_sha256"
+                            ]
+                        ),
+                        expected_configuration=(
+                            detection_metadata[
+                                "configuration"
+                            ]
+                        ),
+                    )
+                )
+
+                if tuple(
+                    detection_result.image_size
+                ) != tuple(
+                    original_image.size
+                ):
+                    raise ValueError(
+                        "Detection image size "
+                        "does not match the "
+                        "evaluation image."
+                    )
+
+                detections = (
+                    detection_result.detections
+                )
+
             sample_start = (
                 time.perf_counter()
             )
@@ -675,6 +1015,7 @@ def main():
                         generation_configuration
                     ),
                     first_pass=first_pass,
+                    detections=detections,
                 )
             )
 
@@ -708,6 +1049,32 @@ def main():
                 raise RuntimeError(
                     "QLoRA Adapter was not "
                     "enabled."
+                )
+
+            if (
+                diagnostics.get(
+                    "graph_version"
+                )
+                != args.graph_version
+            ):
+                raise RuntimeError(
+                    "Generation used an "
+                    "unexpected graph version."
+                )
+
+            if (
+                args.graph_version == "v1"
+                and int(
+                    diagnostics.get(
+                        "detection_count",
+                        -1,
+                    )
+                )
+                != len(detections)
+            ):
+                raise RuntimeError(
+                    "Generation detection count "
+                    "does not match the cache."
                 )
 
             raw_prediction = (
@@ -779,6 +1146,28 @@ def main():
                     ]["optimizer_step"]
                 ),
             }
+
+            if args.graph_version == "v1":
+                record["graph_version"] = "v1"
+                record["detection_count"] = (
+                    len(detections)
+                )
+                record["graph_node_count"] = (
+                    len(
+                        generation_output
+                        .graph_output
+                        .hybrid_output
+                        .nodes
+                    )
+                )
+                record[
+                    "graph_edge_count"
+                ] = (
+                    generation_output
+                    .graph_output
+                    .graph_output
+                    .undirected_edge_count
+                )
 
             append_jsonl(
                 predictions_path,

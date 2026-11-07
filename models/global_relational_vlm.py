@@ -1,7 +1,7 @@
 import types
 from contextlib import nullcontext
 from dataclasses import dataclass
-from typing import Dict, Optional, Sequence, Tuple
+from typing import Dict, Optional, Sequence, Tuple, Union
 
 import torch
 import torch.nn as nn
@@ -32,6 +32,13 @@ from vlm.models.graph_token_encoder import (
     GraphTokenEncoder,
     GraphTokenEncoderOutput,
 )
+from vlm.models.object_graph_v1.encoder import (
+    ObjectGraphTokenEncoderV1,
+    ObjectGraphTokenEncoderV1Output,
+)
+from vlm.detectors.detection_types import (
+    DetectionBox,
+)
 from vlm.models.multimodal_sequence_builder import (
     TrainingSequenceBatch,
     build_training_sequence,
@@ -41,6 +48,12 @@ from vlm.models.qlora_adapter import (
     enable_language_adapter,
     has_qlora_adapter,
 )
+
+
+GraphEncoderOutput = Union[
+    GraphTokenEncoderOutput,
+    ObjectGraphTokenEncoderV1Output,
+]
 
 
 @dataclass
@@ -58,7 +71,7 @@ class GlobalRelationalGenerationOutput:
     response: str
     first_pass: FirstPassOutput
     global_output: GlobalTokenEncoderOutput
-    graph_output: GraphTokenEncoderOutput
+    graph_output: GraphEncoderOutput
     second_pass_diagnostics: Dict
 
 
@@ -68,7 +81,7 @@ class GlobalRelationalTrainingOutput:
     loss: torch.Tensor
     first_pass: FirstPassOutput
     global_output: GlobalTokenEncoderOutput
-    graph_output: GraphTokenEncoderOutput
+    graph_output: GraphEncoderOutput
     sequence_batch: TrainingSequenceBatch
     diagnostics: Dict
 
@@ -212,8 +225,12 @@ class GlobalRelationalVLM(nn.Module):
             GlobalTokenEncoder
         ] = None,
         graph_encoder: Optional[
-            GraphTokenEncoder
+            Union[
+                GraphTokenEncoder,
+                ObjectGraphTokenEncoderV1,
+            ]
         ] = None,
+        graph_version: str = "v0",
     ):
         super().__init__()
 
@@ -240,23 +257,83 @@ class GlobalRelationalVLM(nn.Module):
                 initial_token_scale=0.35,
             )
 
+        graph_version = (
+            str(graph_version)
+            .strip()
+            .lower()
+        )
+
+        if graph_version not in {
+            "v0",
+            "v1",
+        }:
+            raise ValueError(
+                "graph_version must be "
+                "'v0' or 'v1'."
+            )
+
         if graph_encoder is None:
-            graph_encoder = GraphTokenEncoder(
-                top_k=16,
-                token_grid=(16, 16),
-                sigma_p=0.25,
-                threshold=0.70,
-                spatial_weight=0.35,
-                visual_weight=0.20,
-                attention_weight=0.45,
-                node_input_dimension=3587,
-                graph_dimension=256,
-                gnn_layers=2,
-                llm_hidden_dimension=3584,
+            if graph_version == "v0":
+                graph_encoder = GraphTokenEncoder(
+                    top_k=16,
+                    token_grid=(16, 16),
+                    sigma_p=0.25,
+                    threshold=0.70,
+                    spatial_weight=0.35,
+                    visual_weight=0.20,
+                    attention_weight=0.45,
+                    node_input_dimension=3587,
+                    graph_dimension=256,
+                    gnn_layers=2,
+                    llm_hidden_dimension=3584,
+                )
+            else:
+                graph_encoder = (
+                    ObjectGraphTokenEncoderV1(
+                        visual_dimension=3584,
+                        llm_hidden_dimension=3584,
+                        class_count=80,
+                        class_embedding_dimension=32,
+                        token_grid_size=16,
+                        hidden_dimension=256,
+                        gnn_layer_count=2,
+                        max_detection_nodes=10,
+                        max_attention_nodes=2,
+                        max_total_nodes=12,
+                        max_nodes_per_class=4,
+                        graph_top_k=3,
+                        dropout=0.1,
+                        initial_token_scale=0.35,
+                    )
+                )
+
+        if (
+            graph_version == "v0"
+            and not isinstance(
+                graph_encoder,
+                GraphTokenEncoder,
+            )
+        ):
+            raise TypeError(
+                "graph_version='v0' requires "
+                "GraphTokenEncoder."
+            )
+
+        if (
+            graph_version == "v1"
+            and not isinstance(
+                graph_encoder,
+                ObjectGraphTokenEncoderV1,
+            )
+        ):
+            raise TypeError(
+                "graph_version='v1' requires "
+                "ObjectGraphTokenEncoderV1."
             )
 
         self.global_encoder = global_encoder
         self.graph_encoder = graph_encoder
+        self.graph_version = graph_version
 
     @property
     def descriptor_statistics_fitted(self):
@@ -437,9 +514,73 @@ class GlobalRelationalVLM(nn.Module):
             image_size=image_size,
         )
 
+    def _run_graph_encoder(
+        self,
+        first_pass: FirstPassOutput,
+        detections: Optional[
+            Sequence[DetectionBox]
+        ] = None,
+        detach_inputs: bool = False,
+    ) -> GraphEncoderOutput:
+        graph_parameter = next(
+            self.graph_encoder.parameters()
+        )
+
+        graph_device = graph_parameter.device
+        graph_dtype = graph_parameter.dtype
+
+        def prepare_tensor(tensor):
+            if detach_inputs:
+                tensor = (
+                    tensor
+                    .detach()
+                    .clone()
+                )
+
+            return tensor.to(
+                device=graph_device,
+                dtype=graph_dtype,
+            )
+
+        graph_inputs = {
+            "local_attention": prepare_tensor(
+                first_pass
+                .attention_result
+                .local_image_l1
+            ),
+            "attention_profiles": prepare_tensor(
+                first_pass
+                .local_attention_profiles
+            ),
+            "projected_visual_features": (
+                prepare_tensor(
+                    first_pass
+                    .projected_visual_features
+                )
+            ),
+            "tile_grid": first_pass.tile_grid,
+            "image_size": first_pass.image_size,
+        }
+
+        if self.graph_version == "v0":
+            return self.graph_encoder(
+                **graph_inputs
+            )
+
+        if detections is None:
+            detections = ()
+
+        return self.graph_encoder(
+            detections=tuple(detections),
+            **graph_inputs,
+        )
+
     def build_auxiliary_tokens(
         self,
         first_pass: FirstPassOutput,
+        detections: Optional[
+            Sequence[DetectionBox]
+        ] = None,
     ):
         global_device = next(
             self.global_encoder.parameters()
@@ -459,41 +600,10 @@ class GlobalRelationalVLM(nn.Module):
             attention_map
         )
 
-        graph_parameter = next(
-            self.graph_encoder.parameters()
-        )
-
-        graph_device = graph_parameter.device
-        graph_dtype = graph_parameter.dtype
-
-        graph_output = self.graph_encoder(
-            local_attention=(
-                first_pass
-                .attention_result
-                .local_image_l1
-                .to(
-                    device=graph_device,
-                    dtype=graph_dtype,
-                )
-            ),
-            attention_profiles=(
-                first_pass
-                .local_attention_profiles
-                .to(
-                    device=graph_device,
-                    dtype=graph_dtype,
-                )
-            ),
-            projected_visual_features=(
-                first_pass
-                .projected_visual_features
-                .to(
-                    device=graph_device,
-                    dtype=graph_dtype,
-                )
-            ),
-            tile_grid=first_pass.tile_grid,
-            image_size=first_pass.image_size,
+        graph_output = self._run_graph_encoder(
+            first_pass=first_pass,
+            detections=detections,
+            detach_inputs=False,
         )
 
         return global_output, graph_output
@@ -546,6 +656,9 @@ class GlobalRelationalVLM(nn.Module):
         save_activations_on_cpu: bool = True,
         first_pass: Optional[
             FirstPassOutput
+        ] = None,
+        detections: Optional[
+            Sequence[DetectionBox]
         ] = None,
     ) -> GlobalRelationalTrainingOutput:
         """
@@ -704,57 +817,10 @@ class GlobalRelationalVLM(nn.Module):
             attention_map
         )
 
-        graph_parameter = next(
-            self.graph_encoder.parameters()
-        )
-
-        graph_device = graph_parameter.device
-        graph_dtype = graph_parameter.dtype
-
-        local_attention = (
-            first_pass
-            .attention_result
-            .local_image_l1
-            .detach()
-            .clone()
-            .to(
-                device=graph_device,
-                dtype=graph_dtype,
-            )
-        )
-
-        attention_profiles = (
-            first_pass
-            .local_attention_profiles
-            .detach()
-            .clone()
-            .to(
-                device=graph_device,
-                dtype=graph_dtype,
-            )
-        )
-
-        graph_visual_features = (
-            first_pass
-            .projected_visual_features
-            .detach()
-            .clone()
-            .to(
-                device=graph_device,
-                dtype=graph_dtype,
-            )
-        )
-
-        graph_output = self.graph_encoder(
-            local_attention=local_attention,
-            attention_profiles=(
-                attention_profiles
-            ),
-            projected_visual_features=(
-                graph_visual_features
-            ),
-            tile_grid=first_pass.tile_grid,
-            image_size=first_pass.image_size,
+        graph_output = self._run_graph_encoder(
+            first_pass=first_pass,
+            detections=detections,
+            detach_inputs=True,
         )
 
         (
@@ -1052,6 +1118,14 @@ class GlobalRelationalVLM(nn.Module):
                     .parameters()
                     if parameter.requires_grad
                 ),
+                "graph_version": (
+                    self.graph_version
+                ),
+                "detection_count": (
+                    0
+                    if detections is None
+                    else len(detections)
+                ),
                 "supervise_turn_end": bool(
                     supervise_turn_end
                 ),
@@ -1094,6 +1168,9 @@ class GlobalRelationalVLM(nn.Module):
         generation_config=None,
         first_pass: Optional[
             FirstPassOutput
+        ] = None,
+        detections: Optional[
+            Sequence[DetectionBox]
         ] = None,
     ) -> GlobalRelationalGenerationOutput:
         self.eval()
@@ -1148,7 +1225,8 @@ class GlobalRelationalVLM(nn.Module):
             global_output,
             graph_output,
         ) = self.build_auxiliary_tokens(
-            first_pass
+            first_pass=first_pass,
+            detections=detections,
         )
 
         qlora_attached = (
@@ -1200,6 +1278,19 @@ class GlobalRelationalVLM(nn.Module):
                 ),
                 "adapter_enabled": bool(
                     qlora_attached
+                ),
+            }
+        )
+
+        second_pass_diagnostics.update(
+            {
+                "graph_version": (
+                    self.graph_version
+                ),
+                "detection_count": (
+                    0
+                    if detections is None
+                    else len(detections)
                 ),
             }
         )

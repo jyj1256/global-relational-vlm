@@ -1,6 +1,7 @@
 import hashlib
 import json
 import math
+import os
 import random
 from pathlib import Path
 
@@ -19,12 +20,26 @@ from vlm.utils.training_checkpoint import (
 
 
 def seed_everything(seed):
+    # Required by deterministic CUDA matrix
+    # multiplication when CuBLAS is used.
+    os.environ.setdefault(
+        "CUBLAS_WORKSPACE_CONFIG",
+        ":4096:8",
+    )
+
     random.seed(seed)
     np.random.seed(seed)
     torch.manual_seed(seed)
 
     if torch.cuda.is_available():
         torch.cuda.manual_seed_all(seed)
+
+    torch.backends.cudnn.benchmark = False
+    torch.backends.cudnn.deterministic = True
+
+    torch.use_deterministic_algorithms(
+        True
+    )
 
 
 def file_sha256(path):
@@ -263,17 +278,48 @@ def collect_trainable_parameters(
         actual_counts.values()
     )
 
+    graph_version = str(
+        getattr(
+            integrated_model,
+            "graph_version",
+            "v0",
+        )
+    ).strip().lower()
+
+    expected_graph_counts = {
+        "v0": 1_909_510,
+        "v1": 3_072_357,
+    }
+
+    if graph_version not in (
+        expected_graph_counts
+    ):
+        raise RuntimeError(
+            "Unsupported Graph version for "
+            "parameter validation: "
+            f"{graph_version!r}."
+        )
+
     expected_counts = {
         "global": 888_469,
-        "graph": 1_909_510,
+        "graph": (
+            expected_graph_counts[
+                graph_version
+            ]
+        ),
         "adapter": 5_046_272,
-        "total": 7_844_251,
     }
+
+    expected_counts["total"] = sum(
+        expected_counts.values()
+    )
 
     if actual_counts != expected_counts:
         raise RuntimeError(
             "Unexpected trainable parameter "
-            f"counts: {actual_counts}"
+            f"counts for {graph_version}: "
+            f"expected {expected_counts}, "
+            f"found {actual_counts}."
         )
 
     return (

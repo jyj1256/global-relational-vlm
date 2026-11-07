@@ -1,4 +1,5 @@
 import argparse
+import json
 import math
 import sys
 import time
@@ -23,6 +24,10 @@ from vlm.scripts.test_backbone import (
 from vlm.utils.first_pass_cache import (
     build_cache_identity,
     load_first_pass_cache,
+)
+from vlm.utils.object_detection_cache import (
+    detection_cache_path,
+    load_object_detection_cache,
 )
 from vlm.utils.training_checkpoint import (
     load_training_checkpoint,
@@ -57,6 +62,12 @@ DEFAULT_FIRST_PASS_CACHE = (
     / "vlm/outputs/first_pass_cache/"
     "nf4_qlora_maxnum1_train_seed2026"
 )
+DEFAULT_DETECTION_CACHE = (
+    PROJECT_ROOT
+    / "vlm/outputs/object_detections/"
+    "yolo11s_coco"
+)
+
 DEFAULT_STATISTICS = (
     PROJECT_ROOT
     / "vlm/configs/"
@@ -97,6 +108,30 @@ def parse_args():
         "--statistics",
         type=Path,
         default=DEFAULT_STATISTICS,
+    )
+    parser.add_argument(
+        "--graph-version",
+        type=str,
+        choices=(
+            "v0",
+            "v1",
+        ),
+        default="v0",
+    )
+    parser.add_argument(
+        "--detection-cache-root",
+        type=Path,
+        default=DEFAULT_DETECTION_CACHE,
+    )
+    parser.add_argument(
+        "--detection-cache-manifest",
+        type=Path,
+        default=None,
+        help=(
+            "Optional explicit YOLO cache "
+            "manifest. By default it is "
+            "derived from --manifest."
+        ),
     )
     parser.add_argument(
         "--output-dir",
@@ -268,6 +303,201 @@ def validate_args(args):
             args.resume
         )
 
+    if args.graph_version == "v1":
+        if not (
+            args.detection_cache_root
+            .is_dir()
+        ):
+            raise FileNotFoundError(
+                args.detection_cache_root
+            )
+
+        if (
+            args.detection_cache_manifest
+            is not None
+            and not (
+                args
+                .detection_cache_manifest
+                .is_file()
+            )
+        ):
+            raise FileNotFoundError(
+                args.detection_cache_manifest
+            )
+
+
+def load_detection_manifest(
+    args,
+    dataset,
+):
+    if args.detection_cache_manifest is None:
+        metadata_path = (
+            args.detection_cache_root
+            / "manifests"
+            / f"{args.manifest.stem}.json"
+        )
+    else:
+        metadata_path = (
+            args.detection_cache_manifest
+        )
+
+    metadata_path = (
+        metadata_path
+        .expanduser()
+        .resolve()
+    )
+
+    if not metadata_path.is_file():
+        raise FileNotFoundError(
+            metadata_path
+        )
+
+    with metadata_path.open(
+        "r",
+        encoding="utf-8",
+    ) as file:
+        metadata = json.load(file)
+
+    if metadata.get("status") != "complete":
+        raise RuntimeError(
+            "Object detection cache manifest "
+            "is not complete."
+        )
+
+    ordered_image_ids = list(
+        dict.fromkeys(
+            str(dataset[index]["image_id"])
+            for index in range(
+                len(dataset)
+            )
+        )
+    )
+
+    if metadata.get(
+        "dataset_samples"
+    ) != len(dataset):
+        raise RuntimeError(
+            "Detection cache sample count "
+            "does not match the dataset."
+        )
+
+    if metadata.get(
+        "unique_images"
+    ) != len(ordered_image_ids):
+        raise RuntimeError(
+            "Detection cache unique-image "
+            "count does not match."
+        )
+
+    if metadata.get(
+        "image_ids"
+    ) != ordered_image_ids:
+        raise RuntimeError(
+            "Detection cache image IDs "
+            "do not match the dataset."
+        )
+
+    expected_manifest = str(
+        args.manifest
+        .expanduser()
+        .resolve()
+    )
+
+    if metadata.get(
+        "dataset_manifest"
+    ) != expected_manifest:
+        raise RuntimeError(
+            "Detection cache dataset "
+            "manifest does not match."
+        )
+
+    if metadata.get(
+        "completed_images"
+    ) != len(ordered_image_ids):
+        raise RuntimeError(
+            "Detection cache is missing "
+            "completed images."
+        )
+
+    required_detector_fields = {
+        "model_name",
+        "model_version",
+        "weights_sha256",
+    }
+
+    detector_metadata = metadata.get(
+        "detector",
+        {},
+    )
+
+    missing_detector_fields = (
+        required_detector_fields
+        - set(detector_metadata)
+    )
+
+    if missing_detector_fields:
+        raise RuntimeError(
+            "Detection manifest is missing "
+            "detector fields: "
+            f"{sorted(missing_detector_fields)}"
+        )
+
+    required_configuration_fields = {
+        "inference_size",
+        "confidence_threshold",
+        "iou_threshold",
+        "max_detections",
+        "device",
+    }
+
+    detection_configuration = (
+        metadata.get(
+            "configuration",
+            {},
+        )
+    )
+
+    missing_configuration_fields = (
+        required_configuration_fields
+        - set(detection_configuration)
+    )
+
+    if missing_configuration_fields:
+        raise RuntimeError(
+            "Detection manifest is missing "
+            "configuration fields: "
+            f"{sorted(missing_configuration_fields)}"
+        )
+
+    missing_entries = []
+
+    for image_id in ordered_image_ids:
+        entry_path = detection_cache_path(
+            cache_root=(
+                args.detection_cache_root
+            ),
+            image_id=image_id,
+        )
+
+        if not entry_path.is_file():
+            missing_entries.append(
+                str(entry_path)
+            )
+
+            if len(missing_entries) >= 10:
+                break
+
+    if missing_entries:
+        raise FileNotFoundError(
+            "Missing object detection "
+            "entries:\n"
+            + "\n".join(
+                missing_entries
+            )
+        )
+
+    return metadata, metadata_path
+
 
 def initial_progress():
     return {
@@ -361,6 +591,25 @@ def main():
         cache_configuration["max_num"]
     )
 
+    detection_metadata = None
+    detection_metadata_path = None
+    detection_configuration = None
+
+    if args.graph_version == "v1":
+        (
+            detection_metadata,
+            detection_metadata_path,
+        ) = load_detection_manifest(
+            args=args,
+            dataset=dataset,
+        )
+
+        detection_configuration = (
+            detection_metadata[
+                "configuration"
+            ]
+        )
+
     print("Training configuration:")
     print("  Samples:", len(dataset))
     print("  Epochs:", args.epochs)
@@ -378,9 +627,19 @@ def main():
         args.qlora_lr,
     )
     print(
+        "  Graph version:",
+        args.graph_version,
+    )
+    print(
         "  Cache metadata:",
         cache_metadata_path,
     )
+
+    if detection_metadata_path is not None:
+        print(
+            "  Detection metadata:",
+            detection_metadata_path,
+        )
     print("  Output:", args.output_dir)
 
     components = load_training_model(
@@ -392,6 +651,9 @@ def main():
         statistics_path=args.statistics,
         gpu_memory=args.gpu_memory,
         cpu_memory=args.cpu_memory,
+        graph_version=(
+            args.graph_version
+        ),
     )
 
     integrated_model = components[
@@ -568,6 +830,48 @@ def main():
             total_optimizer_steps
         ),
     }
+
+    if args.graph_version == "v1":
+        training_configuration[
+            "graph_version"
+        ] = "v1"
+
+        training_configuration[
+            "object_detection_cache"
+        ] = {
+            "cache_root": str(
+                args
+                .detection_cache_root
+                .expanduser()
+                .resolve()
+            ),
+            "metadata_path": str(
+                detection_metadata_path
+            ),
+            "dataset_manifest": (
+                detection_metadata[
+                    "dataset_manifest"
+                ]
+            ),
+            "image_id_sha256": (
+                detection_metadata[
+                    "image_id_sha256"
+                ]
+            ),
+            "unique_images": (
+                detection_metadata[
+                    "unique_images"
+                ]
+            ),
+            "detector": (
+                detection_metadata[
+                    "detector"
+                ]
+            ),
+            "configuration": (
+                detection_configuration
+            ),
+        }
 
     write_json_atomic(
         args.output_dir
@@ -796,6 +1100,73 @@ def main():
                 dtype=torch.bfloat16,
             )
 
+            detections = None
+
+            if args.graph_version == "v1":
+                image_id = str(
+                    sample["image_id"]
+                )
+
+                object_cache_path = (
+                    detection_cache_path(
+                        cache_root=(
+                            args
+                            .detection_cache_root
+                        ),
+                        image_id=image_id,
+                    )
+                )
+
+                detector_metadata = (
+                    detection_metadata[
+                        "detector"
+                    ]
+                )
+
+                detection_result = (
+                    load_object_detection_cache(
+                        input_path=(
+                            object_cache_path
+                        ),
+                        expected_image_id=(
+                            image_id
+                        ),
+                        expected_model_name=(
+                            detector_metadata[
+                                "model_name"
+                            ]
+                        ),
+                        expected_model_version=(
+                            detector_metadata[
+                                "model_version"
+                            ]
+                        ),
+                        expected_weights_sha256=(
+                            detector_metadata[
+                                "weights_sha256"
+                            ]
+                        ),
+                        expected_configuration=(
+                            detection_configuration
+                        ),
+                    )
+                )
+
+                if tuple(
+                    detection_result.image_size
+                ) != tuple(
+                    original_image.size
+                ):
+                    raise RuntimeError(
+                        "Detection image size "
+                        "mismatch for "
+                        f"{question_id}."
+                    )
+
+                detections = (
+                    detection_result.detections
+                )
+
             training_output = (
                 integrated_model.forward_train(
                     pixel_values=(
@@ -816,6 +1187,7 @@ def main():
                     supervise_turn_end=True,
                     save_activations_on_cpu=True,
                     first_pass=first_pass,
+                    detections=detections,
                 )
             )
 
@@ -838,6 +1210,29 @@ def main():
                 raise RuntimeError(
                     "The supplied First Pass "
                     "cache was not used."
+                )
+
+            if (
+                training_output
+                .diagnostics
+                .get("graph_version")
+                != args.graph_version
+            ):
+                raise RuntimeError(
+                    "Training Graph version "
+                    "diagnostic mismatch."
+                )
+
+            if (
+                args.graph_version == "v1"
+                and training_output
+                .diagnostics
+                .get("detection_count")
+                != len(detections)
+            ):
+                raise RuntimeError(
+                    "Training detection-count "
+                    "diagnostic mismatch."
                 )
 
             group_start = (

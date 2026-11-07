@@ -28,6 +28,7 @@ def load_training_model(
     statistics_path,
     gpu_memory="10GiB",
     cpu_memory="48GiB",
+    graph_version="v0",
 ):
     model_cache_dir = Path(
         model_cache_dir
@@ -128,6 +129,7 @@ def load_training_model(
         GlobalRelationalVLM(
             backbone=backbone,
             tokenizer=tokenizer,
+            graph_version=graph_version,
         )
     )
 

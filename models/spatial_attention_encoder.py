@@ -106,9 +106,11 @@ class SpatialAttentionEncoder(nn.Module):
             stride=2,
         )
 
-        self.spatial_pool = nn.AdaptiveAvgPool2d(
-            output_size=(4, 4)
-        )
+        # The 32x32 input becomes 4x4 after the
+        # three stride-2 blocks. Adaptive pooling
+        # would therefore be an identity operation,
+        # while its CUDA backward is nondeterministic.
+        self.spatial_pool = nn.Identity()
 
         self.projection = nn.Sequential(
             nn.Flatten(),
